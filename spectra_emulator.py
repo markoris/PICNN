@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from scipy.integrate import simpson
 
 class Regressor(torch.nn.Module):
     def __init__(self):
@@ -8,10 +9,11 @@ class Regressor(torch.nn.Module):
             #torch.nn.Linear(6, 128),
             torch.nn.Linear(4, 128),
             torch.nn.LeakyReLU(),
-            torch.nn.Dropout(p=0.25),
+            torch.nn.Dropout(p=0.50),
             torch.nn.Linear(128, 256),
             torch.nn.LeakyReLU(),
-            torch.nn.Dropout(p=0.25),
+            #torch.nn.Dropout(p=0.25),
+            #torch.nn.Linear(256, 384),
             torch.nn.Linear(256, 384),
             #torch.nn.ReLU(),
             #torch.nn.Linear(512, 1024)
@@ -55,7 +57,7 @@ class SpecEmulator(object):
         self.scheduler = torch.optim.lr_scheduler.MultiplicativeLR(self.optim, lr_lambda=0.995)
 
         self.epochs = 500
-        self.batch_size = 64 # smaller batch size = better ability to generalize!
+        self.batch_size = 16 # smaller batch size = better ability to generalize!
         self.validation_model_path = 'pytorch_models/regression_validation.pt'
 
         # Miscellaneous settings
@@ -112,7 +114,7 @@ class SpecEmulator(object):
         if trim:
             self.t_idxs = np.where((self.times > 1.4) & (self.times < 10.4))[0] # AT2017gfo observations
             self.wav_idxs = np.where((self.wavs > 0.39) & (self.wavs < 2.4))[0] # between LSST g and 2MASS K bands
-            self.angle_idxs = np.arange(len(self.angles)) # keep all angles for now, can reduce by factor of 2 if data volume too big
+            self.angle_idxs = np.arange(len(self.angles)//2) # keep all angles for now, can reduce by factor of 2 if data volume too big
 
         else:
             self.t_idxs = np.arange(len(self.times))
@@ -131,8 +133,8 @@ class SpecEmulator(object):
         self.y = self.y[:, :, self.wav_idxs, :]
         self.y = self.y[:, self.t_idxs, :, :]
 
-        self.y = self.y[:, 10, :, 0]
-        self.y_noise = self.y_noise[:, 10, :, 0]
+        self.y = self.y[:, 10, :, 0]*54
+        self.y_noise = self.y_noise[:, 10, :, 0]*54
 
         if self.verbose:
             print('Size of X: ', self.X.shape, ' Size of y: ', self.y.shape, ' Size of y_noise: ', self.y_noise.shape)
@@ -149,12 +151,12 @@ class SpecEmulator(object):
        
         # whiten the input X, output y, and output noise y_noise
  
-        self.mu_X, self.mu_y = np.mean(self.X, axis=0), np.mean(self.y)
+        self.mu_X, self.mu_y, self.mu_y_noise = np.mean(self.X, axis=0), np.mean(self.y), np.mean(self.y_noise)
         self.sigma_X, self.sigma_y = np.std(self.X, axis=0), np.std(self.y)
 
-        #self.X = (self.X - self.mu_X)/self.sigma_X
+        self.X = (self.X - self.mu_X)/self.sigma_X
         self.y = (self.y - self.mu_y)/self.sigma_y
-        self.y_noise = (self.y_noise - self.mu_y)/self.sigma_y
+        self.y_noise = (self.y_noise)/self.sigma_y
 
         print(self.y.mean(), self.y_noise.mean())
 
@@ -183,10 +185,18 @@ class SpecEmulator(object):
         return  
 
     def reduced_chi2_loss(self, y_hat, y, y_noise):
-        degree_of_freedom = y.shape[0] - self.X.shape[1]
-        residual = (y-y_hat)**2/y_noise**2
-        return 1/(degree_of_freedom)*residual.sum()
-        #return residual.sum()
+        #degree_of_freedom = y.shape[0] - self.X.shape[1]
+        residual = (y-y_hat)**2#/y_noise**2
+        # if angle included: 
+        # L_bol_y_hat = simpson(y_hat.sum(axis=-1), self.wavs)
+        # L_bol_y = simpson(y_hat.sum(axis=-1), self.wavs)
+        #alpha = 0.01
+        #L_bol_y_hat = simpson(self.to_numpy(y_hat), self.wavs)
+        #L_bol_y = simpson(self.to_numpy(y), self.wavs)
+        #L_bol_term = np.abs(L_bol_y_hat - L_bol_y).sum()
+        #L_bol_term = np.exp(-alpha*L_bol_term)
+        #return 1/y.shape[0]*residual.sum()*L_bol_term
+        return 1/y.shape[0]*residual.sum()
 
     def smooth_data(self, x, N):
        
@@ -228,10 +238,13 @@ class SpecEmulator(object):
         loader = DataLoader(dataset=dataset, batch_size=self.batch_size, shuffle=True)
 
         lim_valid = 1e10
+        smoothing_window_size = 200
+        reduce_window_size = False
 
         for epoch in range(self.epochs):
 
             loss_train = 0
+            self.model.train()
 
             # for curriculum learning, we introduce a smoothing window starting with size 250
             # the spectra start oversmoothed, and with each epoch, the size of the smoothing window is decreased
@@ -239,7 +252,8 @@ class SpecEmulator(object):
             # purpose of this is to gently guide the NN to learning the fully-featured spectrum
             # by starting with simple, blackbody-like spectra
 
-            smoothing_window_size = 100-epoch
+            if reduce_window_size: 
+                smoothing_window_size -= 1
             for step, (batch_X, batch_y, batch_y_noise) in enumerate(loader):
                 batch_y_hat = self.model(batch_X)
                 if smoothing_window_size > 1: 
@@ -256,9 +270,11 @@ class SpecEmulator(object):
 
             loss_train /= (step+1)
 
-            loss_valid =  self.loss(self.model(self.X_valid), self.y_valid, self.y_noise_valid)
+            with torch.no_grad():
+                self.model.eval()
+                loss_valid =  self.loss(self.model(self.X_valid), self.y_valid, self.y_noise_valid)
 
-            if (epoch+1) % 10 == 0: print('Epoch: ', epoch+1, ' Training loss: ', loss_train.item(), ' Validation loss: ', loss_valid.item())
+            if (epoch+1) % 10 == 0: print('Epoch: ', epoch+1, ' Training loss: ', loss_train.item(), ' Validation loss: ', loss_valid.item(), ' Smoothing window size: ', smoothing_window_size)
 
             # if model improves on best validation error so far, save it!
             if loss_valid <= lim_valid:
@@ -270,7 +286,12 @@ class SpecEmulator(object):
                     'loss': loss_valid,
                 }, self.validation_model_path)
             
-            lim_valid = loss_valid
+                lim_valid = loss_valid
+
+                reduce_window_size = True
+
+            else:
+                reduce_window_size = False
 
             # every 100 epochs, reload the model with lowest validation loss to date
             if epoch+1 % 100 == 0:
@@ -279,8 +300,6 @@ class SpecEmulator(object):
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.optim.load_state_dict(checkpoint['optimizer_state_dict'])
                 lim_valid = checkpoint['loss'] # only keep new models that beat the best so far
-
-                self.model.train()
 
     def plot_random_valid(self):
         
