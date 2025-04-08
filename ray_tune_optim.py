@@ -47,6 +47,7 @@ class Regressor(torch.nn.Module):
             torch.nn.Dropout(p=pd),
             torch.nn.Linear(l1, l2),
             act_func(),
+            torch.nn.Dropout(p=pd),
             torch.nn.Linear(l2, l3),
             act_func(),
             torch.nn.Linear(l3, 384),
@@ -190,7 +191,7 @@ def train_regressor(config):
     net.to(device)
 
     criterion = relative_squared_error_loss
-    optimizer = torch.optim.Adam(net.parameters(), lr=config["lr"])#, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(net.parameters(), lr=config["lr"], weight_decay=1e-4)
 
     checkpoint = get_checkpoint()
     if checkpoint:
@@ -216,7 +217,7 @@ def train_regressor(config):
 
     X, y, X_lims, y_lims = transform(X, y)
 
-    X_train, X_valid, X_test, y_train, y_valid, y_test = split_training_data(X, y)
+    X_train, X_valid, X_test, y_train, y_valid, y_test = split_training_data(X, y, test_frac=0.20)
 
     # append here
 
@@ -239,14 +240,11 @@ def train_regressor(config):
 
     for epoch in range(start_epoch, 1000):  # loop over the dataset multiple times
     
-        smoothing_window_size = 200-10*epoch
+        #smoothing_window_size = 200-5*epoch
         
         running_loss = 0.0
         epoch_steps = 0
-        #for i, data in enumerate(trainloader, 0):
         for i, (inputs, targets) in enumerate(trainloader):
-            # get the inputs; data is a list of [inputs, targets]
-            #inputs, targets, noise = inputs.to(device), targets.to(device), noise.to(device)
 
             # zero the parameter gradients
             optimizer.zero_grad()
@@ -254,10 +252,11 @@ def train_regressor(config):
             # forward + backward + optimize
             outputs = net(inputs)
 
-            if smoothing_window_size > 1:
-                loss = criterion(smooth_data(targets, N=smoothing_window_size), outputs)
-            else: 
-                loss = criterion(targets, outputs)
+            #if smoothing_window_size > 1: 
+            #    loss = criterion(outputs, smooth_data(targets, N=smoothing_window_size))
+            #else:
+                # once smoothing window size <= 1, just use the unsmoothed data
+            loss = criterion(targets, outputs)
             loss.backward()
             optimizer.step()
 
@@ -269,23 +268,20 @@ def train_regressor(config):
                     "[%d, %5d] loss: %.3f"
                     % (epoch + 1, i + 1, running_loss / epoch_steps)
                 )
-                running_loss = 0.0
 
         # Validation loss
         val_loss = 0.0
         val_steps = 0
-        total = 0
-        correct = 0
         for i, (inputs, targets) in enumerate(valloader):
             with torch.no_grad():
-                #inputs, targets, noise = inputs.to(device), targets.to(device), noise.to(device)
 
                 outputs = net(inputs)
-                #_, predicted = torch.max(outputs.data, 1)
-                #total += targets.size(0)
-                #correct += (predicted == targets).sum().item()
 
-                loss = criterion(outputs, targets)
+                #if smoothing_window_size > 1: 
+                #    loss = criterion(outputs, smooth_data(targets, N=smoothing_window_size))
+                #else:
+                    # once smoothing window size <= 1, just use the unsmoothed data
+                loss = criterion(targets, outputs)
                 val_loss += loss.detach().cpu().numpy()
                 val_steps += 1
 
@@ -307,51 +303,52 @@ def train_regressor(config):
 
     print("Finished Training")
 
-def main(num_samples=100, max_num_epochs=10, gpus_per_trial=2):
+def main(num_samples=100, max_num_epochs=10, gpus_per_trial=1):
     
     config = {
-        "l1": tune.choice([2 ** i for i in np.arange(3, 12)]),
-        "l2": tune.choice([2 ** i for i in np.arange(3, 12)]),
-        "l3": tune.choice([2 ** i for i in np.arange(3, 12)]),
-        "pd": tune.choice([0, 0.2, 0.4, 0.6, 0.8]),
+        "l1": tune.choice([2 ** i for i in np.arange(5, 12)]),
+        "l2": tune.choice([2 ** i for i in np.arange(5, 12)]),
+        "l3": tune.choice([2 ** i for i in np.arange(5, 12)]),
+        "pd": tune.choice([0, 0.25, 0.50, 0.75]),
         "act_func": tune.choice([nn.LeakyReLU, nn.ReLU, nn.SELU, nn.Tanh]),
         "lr": tune.loguniform(1e-6, 1e-1),
-        "batch_size": tune.choice([4, 8, 16, 32, 64, 128, 256])
+        "batch_size": tune.choice([16, 32, 64, 128, 256])
     }
 
     scheduler = ASHAScheduler(
-        metric="loss",
+        metric="val loss",
         mode="min",
         max_t=max_num_epochs,
         grace_period=20,
-        reduction_factor=2,
+        reduction_factor=4,
     )
 
-#    result = tune.run(
-#        train_regressor,
-#        resources_per_trial={"cpu": 0, "gpu": gpus_per_trial},
-#        config=config,
-#        num_samples=num_samples,
-#        scheduler=scheduler,
-#        storage_path="/lustre/scratch4/turquoise/mristic/ray_results",
-#        verbose=1,
+    result = tune.run(
+        train_regressor,
+        resources_per_trial={"cpu": 0.5, "gpu": gpus_per_trial},
+        config=config,
+        num_samples=num_samples,
+        scheduler=scheduler,
+        storage_path="/lustre/scratch4/turquoise/mristic/ray_results",
+        verbose=1,
+    )
+
+#    regressor_with_resources = tune.with_resources(train_regressor, {"gpu": gpus_per_trial})
+#    tuner = tune.Tuner(
+#        regressor_with_resources,
+#        param_space=config,
+#        tune_config=TuneConfig(num_samples=num_samples, scheduler=scheduler),
+#        run_config=RunConfig(storage_path="/lustre/scratch4/turquoise/mristic/ray_results", verbose=1),
+##        scaling_config=ScalingConfig(accelerator_type="A100")
 #    )
+#
+#    result = tuner.fit()
 
-    regressor_with_resources = tune.with_resources(train_regressor, {"gpu": gpus_per_trial})
-    tuner = tune.Tuner(
-        regressor_with_resources,
-        param_space=config,
-        tune_config=TuneConfig(num_samples=num_samples, scheduler=scheduler),
-        run_config=RunConfig(storage_path="/lustre/scratch4/turquoise/mristic/ray_results", verbose=1)
-    )
-
-    result = tuner.fit()
-
-    best_trial = result.get_best_trial("val loss", "min", "last-5-avg")
+    best_trial = result.get_best_trial("val loss", "min", "all")
     print(f"Best trial config: {best_trial.config}")
     print(f"Best trial final validation loss: {best_trial.last_result['val loss']}")
 
 if __name__ == "__main__":
     # You can change the number of GPUs per trial here:
-    main(num_samples=20, max_num_epochs=50, gpus_per_trial=1)
+    main(num_samples=5000, max_num_epochs=50, gpus_per_trial=0.5)
 
