@@ -10,17 +10,20 @@ print('data loaded')
 se.preprocess_data()
 print('data preprocessed')
 
-se.split_training_data(se.X, se.y, se.y_noise, test_frac=0.50)
+se.split_training_data(se.X, se.y, test_frac=0.20)
 
-#se.append_input_parameter(se.times, 1)
-#print('appended time as input parameter')
+se.append_input_parameter(se.times, 1)
+print('appended time as input parameter')
 
-#se.append_input_parameter(se.angles, 2)
-#print('appended angle as input parameter')
+#se.append_input_parameter(np.log10(se.wavs), 1)
+#print('appended wavelength as input parameter')
+
+se.append_input_parameter(se.angles, 2)
+print('appended angle as input parameter')
 
 se.get_device()
 print('device: ', se.device)
 
-se.train()
+se.train(epochs=50)
 
-se.plot_random_valid()
+se.save('pytorch_models/regression.pt')
